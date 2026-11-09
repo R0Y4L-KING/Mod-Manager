@@ -14,7 +14,10 @@ What this shim changes
        Here Is Your *Lumii* Pro ⬇️
        📅 Validity: 07/12/2026
        [ ⬇️ DOWNLOAD LUMII ]
-4. Heuristic fallback keeps 2-letter names like 'pw'.
+4. VALIDITY LOOKUP: reads the newest post that actually contains a
+   VALIDITY line (falls back through recent posts), so an app whose
+   latest post has no date still shows its real validity.
+5. Heuristic fallback keeps 2-letter names like 'pw'.
 
 Start command should be:  python boot.py
 """
@@ -140,24 +143,48 @@ def fuzzy_search(app_query: str, limit: int = 3) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Reply formatting
+# Validity lookup + reply formatting
 # ---------------------------------------------------------------------------
-_VAL_RE = re.compile(
-    r"VALIDITY\s*[:\-]*\s*(\d{1,2}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{2,4})",
-    re.IGNORECASE)
+_DATE_RE = re.compile(r"(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{2,4})")
+_LIFETIME_RE = re.compile(
+    r"(lifetime|till\s*update|until\s*update|never\s*expire)", re.IGNORECASE)
 
 
-def _validity(text: str) -> str:
-    """Pull the VALIDITY value out of a post for display."""
+def _validity_from_text(text: str) -> str:
+    """Pull the VALIDITY value out of a post text (tolerant)."""
     if not text:
         return ""
-    m = _VAL_RE.search(text)
+    m = re.search(r"VALIDITY", text, re.IGNORECASE)
     if m:
-        return re.sub(r"\s+", "", m.group(1)).replace("-", "/").replace(".", "/")
-    low = text.lower()
-    for kw in ("lifetime", "untill update", "until update", "till update"):
-        if kw in low:
+        window = text[m.end():m.end() + 45]
+        d = _DATE_RE.search(window)
+        if d:
+            return f"{d.group(1)}/{d.group(2)}/{d.group(3)}"
+        lt = _LIFETIME_RE.search(window)
+        if lt:
             return "Lifetime"
+    # no VALIDITY keyword — fall back to any lifetime mention
+    if _LIFETIME_RE.search(text):
+        return "Lifetime"
+    return ""
+
+
+def _validity_for(app_name: str) -> str:
+    """Validity for an app: newest post that actually has a VALIDITY line.
+
+    Some posts have no date (or the newest one is a re-post without
+    VALIDITY), so walk back through recent posts instead of giving up.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT full_text FROM channel_posts WHERE app_name = ? "
+        "ORDER BY message_id DESC LIMIT 8", (app_name,)
+    ).fetchall()
+    conn.close()
+    for (text,) in rows:
+        v = _validity_from_text(text or "")
+        if v:
+            return v
     return ""
 
 
@@ -173,7 +200,7 @@ async def send_results(update, results: list, query: str) -> None:
     if len(results) == 1:
         post = results[0]
         name = post["app_name"] or query
-        val = _validity(post.get("text") or "")
+        val = _validity_for(name)
 
         text = f"Here Is Your *{bot.escape(name)}* Pro ⬇️"
         if val:
@@ -191,7 +218,7 @@ async def send_results(update, results: list, query: str) -> None:
     rows = []
     for i, post in enumerate(results, 1):
         name = post["app_name"] or "Unknown"
-        val = _validity(post.get("text") or "")
+        val = _validity_for(name)
         line = f"{i}. *{bot.escape(name)}*"
         if val:
             line += f" — 📅 {bot.escape(val)}"
@@ -282,5 +309,5 @@ bot.find_app = find_app
 bot.extract_app_name_from_sentence = extract_app_name_from_sentence
 
 if __name__ == "__main__":
-    logger.info("boot.py: matching + clean replies with inline buttons")
+    logger.info("boot.py: matching + clean replies + validity lookup")
     bot.main()

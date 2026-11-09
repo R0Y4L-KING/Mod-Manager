@@ -3,22 +3,17 @@ Boot shim for MODAPPSKING Search Bot
 ====================================
 Loads bot.py, installs improved app-matching, then starts the bot.
 
-Why this exists
----------------
-The bot answered only when Gemini was available — the free tier allows
-just 20 requests/day, so the quota ran out fast and replies became
-random ('kuch message par reply, kuch par nahi'). Its fuzzy match was
-also too loose ('Paper' matched '4KWallpaper').
-
 What this shim changes
 ----------------------
 1. DIRECT MATCH (no AI, no quota): if a known app name appears in the
-   message, reply immediately. This answers most real requests even
-   when Gemini is rate-limited.
+   message, reply immediately — works even when the Gemini free-tier
+   quota is exhausted.
 2. STRICT FUZZY MATCH: similarity-based (difflib >= 0.75) instead of
    naive substring matching, so wrong apps are no longer returned.
-3. INLINE BUTTON: the reply now carries a tappable button (like Rose
-   bot) that opens the latest channel post for that app.
+3. CLEAN REPLY + INLINE BUTTON, e.g.
+       Here Is Your *Lumii* Pro ⬇️
+       📅 Validity: 07/12/2026
+       [ ⬇️ DOWNLOAD LUMII ]
 4. Heuristic fallback keeps 2-letter names like 'pw'.
 
 Start command should be:  python boot.py
@@ -88,11 +83,7 @@ def _latest_post(app_name: str):
 
 
 def find_direct_matches(message_text: str, limit: int = 5) -> list:
-    """Known app names that literally appear in the message (no AI).
-
-    Short names (<=3 chars) must match a whole word; longer names may
-    sit inside a sentence.
-    """
+    """Known app names that literally appear in the message (no AI)."""
     if len(message_text.split()) > 15:
         return []
     msg_norm = _norm(message_text)
@@ -149,8 +140,27 @@ def fuzzy_search(app_query: str, limit: int = 3) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Reply helper (with inline button, Rose-bot style)
+# Reply formatting
 # ---------------------------------------------------------------------------
+_VAL_RE = re.compile(
+    r"VALIDITY\s*[:\-]*\s*(\d{1,2}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{2,4})",
+    re.IGNORECASE)
+
+
+def _validity(text: str) -> str:
+    """Pull the VALIDITY value out of a post for display."""
+    if not text:
+        return ""
+    m = _VAL_RE.search(text)
+    if m:
+        return re.sub(r"\s+", "", m.group(1)).replace("-", "/").replace(".", "/")
+    low = text.lower()
+    for kw in ("lifetime", "untill update", "until update", "till update"):
+        if kw in low:
+            return "Lifetime"
+    return ""
+
+
 def _button(label: str, link: str):
     """One inline URL button, or None when there is no link."""
     if not link:
@@ -159,35 +169,41 @@ def _button(label: str, link: str):
 
 
 async def send_results(update, results: list, query: str) -> None:
+    """Clean reply + inline download button."""
     if len(results) == 1:
         post = results[0]
         name = post["app_name"] or query
-        preview = (post["text"] or "")[:120]
-        if len(post["text"] or "") > 120:
-            preview += "..."
-        text = (f"📱 *{bot.escape(name)}*\n\n"
-                f"📝 {bot.escape(preview)}")
-        btn = _button(f"⬇️ {name.upper()}", post.get("link"))
+        val = _validity(post.get("text") or "")
+
+        text = f"Here Is Your *{bot.escape(name)}* Pro ⬇️"
+        if val:
+            text += f"\n\n📅 Validity: {bot.escape(val)}"
+
+        btn = _button(f"⬇️ DOWNLOAD {name.upper()}", post.get("link"))
         markup = InlineKeyboardMarkup([[btn]]) if btn else None
         await update.message.reply_text(
             text, parse_mode="Markdown", disable_web_page_preview=True,
             reply_markup=markup)
-    else:
-        lines = [f"📱 *Found {len(results)} matches for* `{bot.escape(query)}`:\n"]
-        rows = []
-        for i, post in enumerate(results, 1):
-            name = post["app_name"] or "Unknown"
-            preview = (post["text"] or "")[:60]
-            if len(post["text"] or "") > 60:
-                preview += "..."
-            lines.append(f"{i}. *{bot.escape(name)}*\n   {bot.escape(preview)}")
-            btn = _button(f"{i}. ⬇️ {name.upper()}", post.get("link"))
-            if btn:
-                rows.append([btn])
-        markup = InlineKeyboardMarkup(rows) if rows else None
-        await update.message.reply_text(
-            "\n".join(lines), parse_mode="Markdown",
-            disable_web_page_preview=True, reply_markup=markup)
+        return
+
+    # Multiple matches
+    lines = [f"Here Is Your *{bot.escape(query)}* Pro ⬇️\n"]
+    rows = []
+    for i, post in enumerate(results, 1):
+        name = post["app_name"] or "Unknown"
+        val = _validity(post.get("text") or "")
+        line = f"{i}. *{bot.escape(name)}*"
+        if val:
+            line += f" — 📅 {bot.escape(val)}"
+        lines.append(line)
+        btn = _button(f"{i}. ⬇️ {name.upper()}", post.get("link"))
+        if btn:
+            rows.append([btn])
+
+    markup = InlineKeyboardMarkup(rows) if rows else None
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="Markdown",
+        disable_web_page_preview=True, reply_markup=markup)
 
 
 # ---------------------------------------------------------------------------
@@ -266,5 +282,5 @@ bot.find_app = find_app
 bot.extract_app_name_from_sentence = extract_app_name_from_sentence
 
 if __name__ == "__main__":
-    logger.info("boot.py: improved matching + inline buttons installed")
+    logger.info("boot.py: matching + clean replies with inline buttons")
     bot.main()

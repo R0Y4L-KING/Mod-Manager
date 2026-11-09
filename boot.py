@@ -17,7 +17,9 @@ What this shim changes
    when Gemini is rate-limited.
 2. STRICT FUZZY MATCH: similarity-based (difflib >= 0.75) instead of
    naive substring matching, so wrong apps are no longer returned.
-3. Heuristic fallback keeps 2-letter names like 'pw'.
+3. INLINE BUTTON: the reply now carries a tappable button (like Rose
+   bot) that opens the latest channel post for that app.
+4. Heuristic fallback keeps 2-letter names like 'pw'.
 
 Start command should be:  python boot.py
 """
@@ -25,6 +27,8 @@ Start command should be:  python boot.py
 import re
 import sqlite3
 import logging
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import bot
 
@@ -145,29 +149,45 @@ def fuzzy_search(app_query: str, limit: int = 3) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Reply helper
+# Reply helper (with inline button, Rose-bot style)
 # ---------------------------------------------------------------------------
+def _button(label: str, link: str):
+    """One inline URL button, or None when there is no link."""
+    if not link:
+        return None
+    return InlineKeyboardButton(label, url=link)
+
+
 async def send_results(update, results: list, query: str) -> None:
     if len(results) == 1:
         post = results[0]
+        name = post["app_name"] or query
         preview = (post["text"] or "")[:120]
         if len(post["text"] or "") > 120:
             preview += "..."
-        reply = (f"📱 *{bot.escape(post['app_name'] or query)}*\n\n"
-                 f"📝 {bot.escape(preview)}\n\n🔗 [Open Post]({post['link']})")
+        text = (f"📱 *{bot.escape(name)}*\n\n"
+                f"📝 {bot.escape(preview)}")
+        btn = _button(f"⬇️ {name.upper()}", post.get("link"))
+        markup = InlineKeyboardMarkup([[btn]]) if btn else None
         await update.message.reply_text(
-            reply, parse_mode="Markdown", disable_web_page_preview=False)
+            text, parse_mode="Markdown", disable_web_page_preview=True,
+            reply_markup=markup)
     else:
         lines = [f"📱 *Found {len(results)} matches for* `{bot.escape(query)}`:\n"]
+        rows = []
         for i, post in enumerate(results, 1):
+            name = post["app_name"] or "Unknown"
             preview = (post["text"] or "")[:60]
             if len(post["text"] or "") > 60:
                 preview += "..."
-            lines.append(
-                f"{i}. *{bot.escape(post['app_name'] or 'Unknown')}*\n"
-                f"   {bot.escape(preview)}\n   🔗 [Open]({post['link']})")
+            lines.append(f"{i}. *{bot.escape(name)}*\n   {bot.escape(preview)}")
+            btn = _button(f"{i}. ⬇️ {name.upper()}", post.get("link"))
+            if btn:
+                rows.append([btn])
+        markup = InlineKeyboardMarkup(rows) if rows else None
         await update.message.reply_text(
-            "\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+            "\n".join(lines), parse_mode="Markdown",
+            disable_web_page_preview=True, reply_markup=markup)
 
 
 # ---------------------------------------------------------------------------
@@ -246,5 +266,5 @@ bot.find_app = find_app
 bot.extract_app_name_from_sentence = extract_app_name_from_sentence
 
 if __name__ == "__main__":
-    logger.info("boot.py: improved matching installed — starting bot")
+    logger.info("boot.py: improved matching + inline buttons installed")
     bot.main()

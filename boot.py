@@ -15,24 +15,31 @@ What this shim changes
        📅 Validity: 07/12/2026
        [ ⬇️ DOWNLOAD LUMII ]
 4. VALIDITY LOOKUP: reads the newest post that actually contains a
-   VALIDITY line (falls back through recent posts), so an app whose
-   latest post has no date still shows its real validity.
-5. Heuristic fallback keeps 2-letter names like 'pw'.
+   VALIDITY line (falls back through recent posts).
+5. EDITED POSTS: when you edit a channel post (e.g. add/fix VALIDITY)
+   the stored text is updated immediately instead of going stale.
+6. PERIODIC RE-IMPORT every 6h so new/edited posts are picked up even
+   if the bot was asleep.
 
 Start command should be:  python boot.py
 """
 
 import re
+import time
 import sqlite3
+import asyncio
 import logging
+import threading
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import MessageHandler, filters
 
 import bot
 
 logger = logging.getLogger("boot")
 
 DB_PATH = bot.DB_PATH
+AUTO_IMPORT_HOURS = 6
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +50,10 @@ def _norm(s: str) -> str:
 
 
 _cache = {"count": -1, "items": []}
+
+
+def _invalidate_cache():
+    _cache["count"] = -1
 
 
 def _get_name_index():
@@ -163,18 +174,13 @@ def _validity_from_text(text: str) -> str:
         lt = _LIFETIME_RE.search(window)
         if lt:
             return "Lifetime"
-    # no VALIDITY keyword — fall back to any lifetime mention
     if _LIFETIME_RE.search(text):
         return "Lifetime"
     return ""
 
 
 def _validity_for(app_name: str) -> str:
-    """Validity for an app: newest post that actually has a VALIDITY line.
-
-    Some posts have no date (or the newest one is a re-post without
-    VALIDITY), so walk back through recent posts instead of giving up.
-    """
+    """Validity for an app: newest post that actually has a VALIDITY line."""
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
         "SELECT full_text FROM channel_posts WHERE app_name = ? "
@@ -213,7 +219,6 @@ async def send_results(update, results: list, query: str) -> None:
             reply_markup=markup)
         return
 
-    # Multiple matches
     lines = [f"Here Is Your *{bot.escape(query)}* Pro ⬇️\n"]
     rows = []
     for i, post in enumerate(results, 1):
@@ -242,7 +247,6 @@ async def find_app(update, context) -> None:
 
     message_text = update.message.text
 
-    # 1) Direct match against known app names — no AI, no quota used.
     direct = find_direct_matches(message_text, limit=5)
     if direct:
         logger.info("Direct match: %s (from: '%s')",
@@ -250,12 +254,10 @@ async def find_app(update, context) -> None:
         await send_results(update, direct, direct[0]["app_name"])
         return
 
-    # 2) Not a known name — decide whether it looks like a request at all
     gemini_on = bot._gemini_available()
     if not bot.should_process_message(message_text, gemini_on):
         return
 
-    # 3) AI extraction (spelling mistakes, Hinglish sentences)
     app_query = await bot.gemini_extract_app_name(message_text)
     results = []
     if app_query and len(app_query) >= 2:
@@ -272,6 +274,55 @@ async def find_app(update, context) -> None:
         return
 
     await send_results(update, results, app_query or results[0]["app_name"])
+
+
+# ---------------------------------------------------------------------------
+# Edited channel posts — keep stored text fresh
+# ---------------------------------------------------------------------------
+async def edited_channel_post_handler(update, context) -> None:
+    """Re-store a post when it is edited (e.g. VALIDITY added later)."""
+    post = getattr(update, "edited_channel_post", None)
+    if not post:
+        return
+    text = post.text or post.caption or ""
+    if not text:
+        return
+    try:
+        tags = bot.extract_hashtags(text)
+        app_name = tags[0] if tags else text[:50]
+        link = bot.build_message_link(post.chat.id, post.message_id)
+        bot.store_post(post.message_id, post.chat.id, app_name, text, link)
+        _invalidate_cache()
+        logger.info("Edited post re-stored: %s (msg %s)",
+                    app_name, post.message_id)
+    except Exception as e:
+        logger.error("Edited-post handling failed: %s", e)
+
+
+async def _post_init(application):
+    """Register the edited-post handler, then run the bot's own post_init."""
+    try:
+        application.add_handler(MessageHandler(
+            filters.UpdateType.EDITED_CHANNEL_POST, edited_channel_post_handler))
+        logger.info("Edited-channel-post handler registered")
+    except Exception as e:
+        logger.warning("Could not register edited-post handler: %s", e)
+    await _orig_post_init(application)
+
+
+# ---------------------------------------------------------------------------
+# Periodic re-import (new + edited posts while the bot was asleep)
+# ---------------------------------------------------------------------------
+def _auto_import_loop():
+    while True:
+        time.sleep(AUTO_IMPORT_HOURS * 3600)
+        try:
+            logger.info("Auto-import: refreshing channel history...")
+            asyncio.run(bot.auto_import_all_channels())
+            _invalidate_cache()
+            logger.info("Auto-import done")
+        except Exception as e:
+            logger.error("Auto-import failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -302,12 +353,16 @@ def extract_app_name_from_sentence(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Install patches and start
 # ---------------------------------------------------------------------------
+_orig_post_init = bot.post_init
+
 bot.find_direct_matches = find_direct_matches
 bot.fuzzy_search = fuzzy_search
 bot.send_results = send_results
 bot.find_app = find_app
 bot.extract_app_name_from_sentence = extract_app_name_from_sentence
+bot.post_init = _post_init
 
 if __name__ == "__main__":
-    logger.info("boot.py: matching + clean replies + validity lookup")
+    logger.info("boot.py: matching + clean replies + edited posts + auto-import")
+    threading.Thread(target=_auto_import_loop, daemon=True).start()
     bot.main()
